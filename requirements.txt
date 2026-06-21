@@ -2,3 +2,6 @@ flask
 requests
 apscheduler
 pytz
+yfinance
+pandas
+numpy
