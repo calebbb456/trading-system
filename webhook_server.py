@@ -17,6 +17,7 @@ daily_pnl = 0.0
 consecutive_losses = 0
 system_halted = False
 simulated_crypto_position = None
+manual_position = None
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -60,6 +61,20 @@ def calculate_indicators(df):
     df['vol_avg'] = df['Volume'].rolling(20).mean()
     return df
 
+def get_current_price_and_atr(symbol):
+    try:
+        df = yf.download(symbol, period="5d", interval="5m", progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        if len(df) < 20:
+            return None, None
+        df = calculate_indicators(df)
+        last = df.iloc[-1]
+        return float(last['Close']), float(last['atr'])
+    except Exception as e:
+        print("Error getting price/atr: " + str(e))
+        return None, None
+
 def get_spy_condition_details():
     try:
         df5 = yf.download("SPY", period="5d", interval="5m", progress=False)
@@ -77,20 +92,14 @@ def get_spy_condition_details():
         or_window = today_session.between_time("09:30", "10:00")
         or_high = float(or_window['High'].max()) if len(or_window) > 0 else None
         or_low = float(or_window['Low'].min()) if len(or_window) > 0 else None
-        close = float(last['Close'])
-        ema9 = float(last['ema9'])
-        ema21 = float(last['ema21'])
-        rsi = float(last['rsi'])
-        vwap = float(last['vwap'])
-        volume = float(last['Volume'])
-        vol_avg = float(last['vol_avg'])
-        htf_bull = float(df15.iloc[-1]['ema9']) > float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) > float(df60.iloc[-1]['ema21'])
-        htf_bear = float(df15.iloc[-1]['ema9']) < float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) < float(df60.iloc[-1]['ema21'])
         return {
-            "close": close, "ema9": ema9, "ema21": ema21, "rsi": rsi,
-            "vwap": vwap, "volume": volume, "vol_avg": vol_avg,
+            "close": float(last['Close']), "ema9": float(last['ema9']),
+            "ema21": float(last['ema21']), "rsi": float(last['rsi']),
+            "vwap": float(last['vwap']), "volume": float(last['Volume']),
+            "vol_avg": float(last['vol_avg']), "atr": float(last['atr']),
             "or_high": or_high, "or_low": or_low,
-            "htf_bull": htf_bull, "htf_bear": htf_bear
+            "htf_bull": float(df15.iloc[-1]['ema9']) > float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) > float(df60.iloc[-1]['ema21']),
+            "htf_bear": float(df15.iloc[-1]['ema9']) < float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) < float(df60.iloc[-1]['ema21'])
         }
     except Exception as e:
         print("Error getting SPY conditions: " + str(e))
@@ -107,19 +116,13 @@ def get_btc_condition_details():
         df15 = calculate_indicators(df15)
         df60 = calculate_indicators(df60)
         last = df5.iloc[-1]
-        close = float(last['Close'])
-        ema9 = float(last['ema9'])
-        ema21 = float(last['ema21'])
-        rsi = float(last['rsi'])
-        vwap = float(last['vwap'])
-        volume = float(last['Volume'])
-        vol_avg = float(last['vol_avg'])
-        htf_bull = float(df15.iloc[-1]['ema9']) > float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) > float(df60.iloc[-1]['ema21'])
-        htf_bear = float(df15.iloc[-1]['ema9']) < float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) < float(df60.iloc[-1]['ema21'])
         return {
-            "close": close, "ema9": ema9, "ema21": ema21, "rsi": rsi,
-            "vwap": vwap, "volume": volume, "vol_avg": vol_avg,
-            "htf_bull": htf_bull, "htf_bear": htf_bear
+            "close": float(last['Close']), "ema9": float(last['ema9']),
+            "ema21": float(last['ema21']), "rsi": float(last['rsi']),
+            "vwap": float(last['vwap']), "volume": float(last['Volume']),
+            "vol_avg": float(last['vol_avg']), "atr": float(last['atr']),
+            "htf_bull": float(df15.iloc[-1]['ema9']) > float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) > float(df60.iloc[-1]['ema21']),
+            "htf_bear": float(df15.iloc[-1]['ema9']) < float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) < float(df60.iloc[-1]['ema21'])
         }
     except Exception as e:
         print("Error getting BTC conditions: " + str(e))
@@ -146,8 +149,6 @@ def process_trade_signal(data):
     if not key or not secret:
         discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, "Missing Alpaca credentials. Trade skipped.")
         return
-    if config.TRADING_MODE == "live":
-        discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, "LIVE TRADING MODE ACTIVATED - real money is now being used")
     side = "buy" if action == "buy" else "sell"
     qty = 1
     order = {
@@ -157,44 +158,65 @@ def process_trade_signal(data):
         "stop_loss": {"stop_price": round(stop_loss, 2)}
     }
     headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
-    resp = requests.post(base_url + "/v2/orders", json=order, headers=headers, timeout=10)
+    requests.post(base_url + "/v2/orders", json=order, headers=headers, timeout=10)
     tag = "[LIVE]" if config.TRADING_MODE == "live" else "[PAPER]"
     timestamp = datetime.datetime.now().isoformat()
     trades_today.append({"symbol": symbol, "side": side, "price": price, "time": timestamp})
-    embed_color = 0x3498db if config.TRADING_MODE == "paper" else 0x2ecc71
+    color = 0x2ecc71 if side == "buy" else 0xe74c3c
     embed = {
-        "title": tag + " " + side.upper() + " " + symbol,
-        "color": embed_color,
+        "title": ("🟢 " if side == "buy" else "🔴 ") + tag + " " + side.upper() + " " + symbol,
+        "color": color,
         "fields": [
-            {"name": "Price", "value": str(price), "inline": True},
-            {"name": "Stop Loss", "value": str(stop_loss), "inline": True},
-            {"name": "Take Profit 1", "value": str(tp1), "inline": True}
-        ]
+            {"name": "💰 Entry Price", "value": "$" + str(round(price, 2)), "inline": True},
+            {"name": "🛑 Stop Loss", "value": "$" + str(round(stop_loss, 2)), "inline": True},
+            {"name": "🎯 Take Profit", "value": "$" + str(round(tp1, 2)), "inline": True},
+            {"name": "📋 Mode", "value": config.TRADING_MODE.upper(), "inline": True},
+            {"name": "🕐 Time", "value": timestamp[:19], "inline": True}
+        ],
+        "footer": {"text": "Momentum Confluence Scalper"}
     }
     target_channel = config.DISCORD_WEBHOOK_LIVE_TRADES if config.TRADING_MODE == "live" else config.DISCORD_WEBHOOK_PAPER_TRADES
     discord_post(target_channel, embed=embed)
     discord_post(config.DISCORD_WEBHOOK_TRADE_ALERTS, embed=embed)
 
+def make_embed(title, color, fields, footer="Momentum Confluence Scalper"):
+    return discord.Embed(
+        title=title,
+        color=color,
+        timestamp=datetime.datetime.utcnow()
+    ).set_footer(text=footer)
+
+async def send_embed(ctx, title, color, fields, footer="Momentum Confluence Scalper"):
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.datetime.utcnow())
+    for name, value, inline in fields:
+        embed.add_field(name=name, value=value, inline=inline)
+    embed.set_footer(text=footer)
+    await ctx.send(embed=embed)
+
+# ====== DISCORD COMMANDS ======
+
 @bot.command(name="status")
 async def cmd_status(ctx):
-    halted_text = "HALTED" if system_halted else "Running"
-    msg = (
-        "**System Status**\n"
-        "Mode: " + config.TRADING_MODE.upper() + "\n"
-        "Status: " + halted_text + "\n"
-        "Trades today: " + str(len(trades_today)) + " / " + str(config.MAX_TRADES_PER_DAY) + "\n"
-        "Simulated P&L today: $" + str(round(daily_pnl, 2))
-    )
-    await ctx.send(msg)
+    halted_text = "🔴 HALTED" if system_halted else "🟢 Running"
+    mode_color = 0xe74c3c if config.TRADING_MODE == "live" else 0x3498db
+    await send_embed(ctx, "⚙️ System Status", mode_color, [
+        ("🔁 Mode", config.TRADING_MODE.upper(), True),
+        ("📡 Status", halted_text, True),
+        ("📊 Trades Today", str(len(trades_today)) + " / " + str(config.MAX_TRADES_PER_DAY), True),
+        ("💵 Simulated P&L", "$" + str(round(daily_pnl, 2)), True),
+        ("🤖 Bot", "Online", True),
+        ("⏰ Checked At", datetime.datetime.now(pytz.timezone("America/New_York")).strftime("%I:%M %p ET"), True)
+    ])
 
 @bot.command(name="check")
 async def cmd_check(ctx):
-    await ctx.send("Checking SPY conditions now, give me a few seconds...")
+    checking = discord.Embed(title="🔍 Checking SPY...", color=0xf39c12, description="Fetching live conditions, give me a few seconds...")
+    await ctx.send(embed=checking)
     d = get_spy_condition_details()
     if d is None:
-        await ctx.send("Could not fetch SPY data right now. Try again in a minute.")
+        await send_embed(ctx, "❌ SPY Data Unavailable", 0xe74c3c, [("Error", "Could not fetch SPY data. Market may be closed or try again in a minute.", False)])
         return
-    def yn(val): return "YES" if val else "NO"
+    def yn(val): return "✅ YES" if val else "❌ NO"
     ema_bull = d['ema9'] > d['ema21']
     ema_bear = d['ema9'] < d['ema21']
     above_vwap = d['close'] > d['vwap']
@@ -206,34 +228,34 @@ async def cmd_check(ctx):
     or_bear = d['or_low'] is not None and d['close'] < d['or_low']
     long_score = sum([ema_bull, above_vwap, rsi_bull, vol_ok, or_bull, d['htf_bull']])
     short_score = sum([ema_bear, below_vwap, rsi_bear, vol_ok, or_bear, d['htf_bear']])
-    msg = (
-        "**SPY Signal Check** (price: $" + str(round(d['close'], 2)) + ")\n\n"
-        "**LONG conditions (" + str(long_score) + "/6 passing):**\n"
-        "EMA9 > EMA21: " + yn(ema_bull) + "\n"
-        "Price > VWAP: " + yn(above_vwap) + "\n"
-        "RSI 45-65: " + yn(rsi_bull) + " (RSI = " + str(round(d['rsi'], 1)) + ")\n"
-        "Volume spike: " + yn(vol_ok) + "\n"
-        "Above opening range high: " + yn(or_bull) + "\n"
-        "HTF bias bullish: " + yn(d['htf_bull']) + "\n\n"
-        "**SHORT conditions (" + str(short_score) + "/6 passing):**\n"
-        "EMA9 < EMA21: " + yn(ema_bear) + "\n"
-        "Price < VWAP: " + yn(below_vwap) + "\n"
-        "RSI 35-55: " + yn(rsi_bear) + " (RSI = " + str(round(d['rsi'], 1)) + ")\n"
-        "Volume spike: " + yn(vol_ok) + "\n"
-        "Below opening range low: " + yn(or_bear) + "\n"
-        "HTF bias bearish: " + yn(d['htf_bear']) + "\n\n"
-        "**Need all 6 to trigger a trade.**"
-    )
-    await ctx.send(msg)
+    long_color = 0x2ecc71 if long_score == 6 else 0xf39c12 if long_score >= 4 else 0xe74c3c
+    await send_embed(ctx, "📈 SPY Signal Check — $" + str(round(d['close'], 2)), long_color, [
+        ("🟢 LONG Score", str(long_score) + "/6 passing", False),
+        ("EMA9 > EMA21", yn(ema_bull), True),
+        ("Price > VWAP", yn(above_vwap), True),
+        ("RSI 45-65", yn(rsi_bull) + " (" + str(round(d['rsi'], 1)) + ")", True),
+        ("Volume Spike", yn(vol_ok), True),
+        ("Above OR High", yn(or_bull), True),
+        ("HTF Bullish", yn(d['htf_bull']), True),
+        ("🔴 SHORT Score", str(short_score) + "/6 passing", False),
+        ("EMA9 < EMA21", yn(ema_bear), True),
+        ("Price < VWAP", yn(below_vwap), True),
+        ("RSI 35-55", yn(rsi_bear) + " (" + str(round(d['rsi'], 1)) + ")", True),
+        ("Volume Spike", yn(vol_ok), True),
+        ("Below OR Low", yn(or_bear), True),
+        ("HTF Bearish", yn(d['htf_bear']), True),
+        ("⚡ Trigger", "Need ALL 6 to fire a trade", False)
+    ])
 
 @bot.command(name="btccheck")
 async def cmd_btccheck(ctx):
-    await ctx.send("Checking BTC-USD conditions now, give me a few seconds...")
+    checking = discord.Embed(title="🔍 Checking BTC-USD...", color=0xf39c12, description="Fetching live conditions, give me a few seconds...")
+    await ctx.send(embed=checking)
     d = get_btc_condition_details()
     if d is None:
-        await ctx.send("Could not fetch BTC data right now. Try again in a minute.")
+        await send_embed(ctx, "❌ BTC Data Unavailable", 0xe74c3c, [("Error", "Could not fetch BTC data. Try again in a minute.", False)])
         return
-    def yn(val): return "YES" if val else "NO"
+    def yn(val): return "✅ YES" if val else "❌ NO"
     ema_bull = d['ema9'] > d['ema21']
     ema_bear = d['ema9'] < d['ema21']
     above_vwap = d['close'] > d['vwap']
@@ -243,33 +265,195 @@ async def cmd_btccheck(ctx):
     vol_ok = d['volume'] > d['vol_avg'] * 1.5
     long_score = sum([ema_bull, above_vwap, rsi_bull, vol_ok, d['htf_bull']])
     short_score = sum([ema_bear, below_vwap, rsi_bear, vol_ok, d['htf_bear']])
-    msg = (
-        "**BTC-USD Signal Check** (price: $" + str(round(d['close'], 2)) + ")\n\n"
-        "**LONG conditions (" + str(long_score) + "/5 passing):**\n"
-        "EMA9 > EMA21: " + yn(ema_bull) + "\n"
-        "Price > VWAP: " + yn(above_vwap) + "\n"
-        "RSI 45-65: " + yn(rsi_bull) + " (RSI = " + str(round(d['rsi'], 1)) + ")\n"
-        "Volume spike: " + yn(vol_ok) + "\n"
-        "HTF bias bullish: " + yn(d['htf_bull']) + "\n\n"
-        "**SHORT conditions (" + str(short_score) + "/5 passing):**\n"
-        "EMA9 < EMA21: " + yn(ema_bear) + "\n"
-        "Price < VWAP: " + yn(below_vwap) + "\n"
-        "RSI 35-55: " + yn(rsi_bear) + " (RSI = " + str(round(d['rsi'], 1)) + ")\n"
-        "Volume spike: " + yn(vol_ok) + "\n"
-        "HTF bias bearish: " + yn(d['htf_bear']) + "\n\n"
-        "**Need all 5 to trigger a sandbox signal.**"
-    )
-    await ctx.send(msg)
+    btc_color = 0x2ecc71 if long_score == 5 or short_score == 5 else 0xf39c12 if long_score >= 3 or short_score >= 3 else 0xe74c3c
+    await send_embed(ctx, "₿ BTC-USD Signal Check — $" + str(round(d['close'], 2)), btc_color, [
+        ("🟢 LONG Score", str(long_score) + "/5 passing", False),
+        ("EMA9 > EMA21", yn(ema_bull), True),
+        ("Price > VWAP", yn(above_vwap), True),
+        ("RSI 45-65", yn(rsi_bull) + " (" + str(round(d['rsi'], 1)) + ")", True),
+        ("Volume Spike", yn(vol_ok), True),
+        ("HTF Bullish", yn(d['htf_bull']), True),
+        ("🔴 SHORT Score", str(short_score) + "/5 passing", False),
+        ("EMA9 < EMA21", yn(ema_bear), True),
+        ("Price < VWAP", yn(below_vwap), True),
+        ("RSI 35-55", yn(rsi_bear) + " (" + str(round(d['rsi'], 1)) + ")", True),
+        ("Volume Spike", yn(vol_ok), True),
+        ("HTF Bearish", yn(d['htf_bear']), True),
+        ("⚡ Trigger", "Need ALL 5 to fire a sandbox signal", False)
+    ])
+
+@bot.command(name="buy")
+async def cmd_buy(ctx):
+    global manual_position
+    if manual_position is not None:
+        await send_embed(ctx, "⚠️ Position Already Open", 0xe74c3c, [
+            ("Active Position", manual_position['direction'].upper() + " " + manual_position['symbol'], True),
+            ("Entry", "$" + str(round(manual_position['entry'], 2)), True),
+            ("Tip", "Use /close to close it first", False)
+        ])
+        return
+    ny_tz = pytz.timezone("America/New_York")
+    now = datetime.datetime.now(ny_tz)
+    symbol = "BTC-USD" if now.weekday() >= 5 else "SPY"
+    await ctx.send(embed=discord.Embed(title="⏳ Opening BUY...", color=0x2ecc71, description="Fetching current price and ATR for " + symbol + "..."))
+    price, atr = get_current_price_and_atr(symbol)
+    if price is None:
+        await send_embed(ctx, "❌ Failed to Open BUY", 0xe74c3c, [("Error", "Could not fetch price data. Try again.", False)])
+        return
+    stop_loss = price - atr * 1.5
+    take_profit = price + atr * 3.0
+    manual_position = {
+        "symbol": symbol, "direction": "buy",
+        "entry": price, "stop_loss": stop_loss,
+        "take_profit": take_profit, "time": now.isoformat()
+    }
+    await send_embed(ctx, "🟢 MANUAL BUY OPENED — " + symbol, 0x2ecc71, [
+        ("💰 Entry Price", "$" + str(round(price, 2)), True),
+        ("🛑 Stop Loss", "$" + str(round(stop_loss, 2)), True),
+        ("🎯 Take Profit", "$" + str(round(take_profit, 2)), True),
+        ("📉 Risk", "$" + str(round(price - stop_loss, 2)) + " per unit", True),
+        ("📈 Reward", "$" + str(round(take_profit - price, 2)) + " per unit", True),
+        ("⚖️ R:R Ratio", "1:2", True),
+        ("📋 Mode", "SANDBOX — not sent to Alpaca", False),
+        ("ℹ️ Info", "Bot will track this and post result when stop or target is hit. Use /close to exit early.", False)
+    ])
+    discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
+        "title": "🟢 MANUAL BUY — " + symbol,
+        "color": 0x2ecc71,
+        "fields": [
+            {"name": "💰 Entry", "value": "$" + str(round(price, 2)), "inline": True},
+            {"name": "🛑 Stop", "value": "$" + str(round(stop_loss, 2)), "inline": True},
+            {"name": "🎯 Target", "value": "$" + str(round(take_profit, 2)), "inline": True}
+        ],
+        "footer": {"text": "Manual trade — sandbox tracking"}
+    })
+
+@bot.command(name="sell")
+async def cmd_sell(ctx):
+    global manual_position
+    if manual_position is not None:
+        await send_embed(ctx, "⚠️ Position Already Open", 0xe74c3c, [
+            ("Active Position", manual_position['direction'].upper() + " " + manual_position['symbol'], True),
+            ("Entry", "$" + str(round(manual_position['entry'], 2)), True),
+            ("Tip", "Use /close to close it first", False)
+        ])
+        return
+    ny_tz = pytz.timezone("America/New_York")
+    now = datetime.datetime.now(ny_tz)
+    symbol = "BTC-USD" if now.weekday() >= 5 else "SPY"
+    await ctx.send(embed=discord.Embed(title="⏳ Opening SELL...", color=0xe74c3c, description="Fetching current price and ATR for " + symbol + "..."))
+    price, atr = get_current_price_and_atr(symbol)
+    if price is None:
+        await send_embed(ctx, "❌ Failed to Open SELL", 0xe74c3c, [("Error", "Could not fetch price data. Try again.", False)])
+        return
+    stop_loss = price + atr * 1.5
+    take_profit = price - atr * 3.0
+    manual_position = {
+        "symbol": symbol, "direction": "sell",
+        "entry": price, "stop_loss": stop_loss,
+        "take_profit": take_profit, "time": now.isoformat()
+    }
+    await send_embed(ctx, "🔴 MANUAL SELL OPENED — " + symbol, 0xe74c3c, [
+        ("💰 Entry Price", "$" + str(round(price, 2)), True),
+        ("🛑 Stop Loss", "$" + str(round(stop_loss, 2)), True),
+        ("🎯 Take Profit", "$" + str(round(take_profit, 2)), True),
+        ("📉 Risk", "$" + str(round(stop_loss - price, 2)) + " per unit", True),
+        ("📈 Reward", "$" + str(round(price - take_profit, 2)) + " per unit", True),
+        ("⚖️ R:R Ratio", "1:2", True),
+        ("📋 Mode", "SANDBOX — not sent to Alpaca", False),
+        ("ℹ️ Info", "Bot will track this and post result when stop or target is hit. Use /close to exit early.", False)
+    ])
+    discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
+        "title": "🔴 MANUAL SELL — " + symbol,
+        "color": 0xe74c3c,
+        "fields": [
+            {"name": "💰 Entry", "value": "$" + str(round(price, 2)), "inline": True},
+            {"name": "🛑 Stop", "value": "$" + str(round(stop_loss, 2)), "inline": True},
+            {"name": "🎯 Target", "value": "$" + str(round(take_profit, 2)), "inline": True}
+        ],
+        "footer": {"text": "Manual trade — sandbox tracking"}
+    })
+
+@bot.command(name="close")
+async def cmd_close(ctx):
+    global manual_position
+    if manual_position is None:
+        await send_embed(ctx, "⚠️ No Open Position", 0xf39c12, [("Info", "You don't have a manual position open right now.", False)])
+        return
+    pos = manual_position
+    price, _ = get_current_price_and_atr(pos['symbol'])
+    if price is None:
+        await send_embed(ctx, "❌ Could Not Fetch Price", 0xe74c3c, [("Error", "Try again in a moment.", False)])
+        return
+    if pos['direction'] == "buy":
+        pnl = price - pos['entry']
+    else:
+        pnl = pos['entry'] - price
+    pnl_pct = (pnl / pos['entry']) * 100
+    result = "WIN 🏆" if pnl > 0 else "LOSS 📉"
+    color = 0x2ecc71 if pnl > 0 else 0xe74c3c
+    manual_position = None
+    await send_embed(ctx, "🔒 Position Closed Manually — " + result, color, [
+        ("📊 Symbol", pos['symbol'], True),
+        ("📋 Direction", pos['direction'].upper(), True),
+        ("💰 Entry", "$" + str(round(pos['entry'], 2)), True),
+        ("🏁 Exit Price", "$" + str(round(price, 2)), True),
+        ("💵 P&L", ("+" if pnl > 0 else "") + "$" + str(round(pnl, 2)), True),
+        ("📈 Return", ("+" if pnl > 0 else "") + str(round(pnl_pct, 2)) + "%", True)
+    ])
+    discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
+        "title": "🔒 MANUAL CLOSE — " + result,
+        "color": color,
+        "fields": [
+            {"name": "Symbol", "value": pos['symbol'], "inline": True},
+            {"name": "Direction", "value": pos['direction'].upper(), "inline": True},
+            {"name": "P&L", "value": ("+" if pnl > 0 else "") + "$" + str(round(pnl, 2)), "inline": True}
+        ],
+        "footer": {"text": "Manual close"}
+    })
+
+@bot.command(name="position")
+async def cmd_position(ctx):
+    global manual_position
+    if manual_position is None:
+        await send_embed(ctx, "📭 No Open Position", 0x95a5a6, [("Info", "No manual position is currently open. Use /buy or /sell to open one.", False)])
+        return
+    pos = manual_position
+    price, _ = get_current_price_and_atr(pos['symbol'])
+    if price is None:
+        await send_embed(ctx, "⚠️ Position Open — Price Unavailable", 0xf39c12, [
+            ("Symbol", pos['symbol'], True),
+            ("Direction", pos['direction'].upper(), True),
+            ("Entry", "$" + str(round(pos['entry'], 2)), True)
+        ])
+        return
+    if pos['direction'] == "buy":
+        pnl = price - pos['entry']
+    else:
+        pnl = pos['entry'] - price
+    pnl_pct = (pnl / pos['entry']) * 100
+    color = 0x2ecc71 if pnl > 0 else 0xe74c3c
+    await send_embed(ctx, "📊 Open Position — " + pos['symbol'], color, [
+        ("📋 Direction", pos['direction'].upper(), True),
+        ("💰 Entry", "$" + str(round(pos['entry'], 2)), True),
+        ("📡 Current Price", "$" + str(round(price, 2)), True),
+        ("🛑 Stop Loss", "$" + str(round(pos['stop_loss'], 2)), True),
+        ("🎯 Take Profit", "$" + str(round(pos['take_profit'], 2)), True),
+        ("💵 Unrealized P&L", ("+" if pnl > 0 else "") + "$" + str(round(pnl, 2)) + " (" + str(round(pnl_pct, 2)) + "%)", True),
+        ("🕐 Opened At", pos['time'][:19], False)
+    ])
 
 @bot.command(name="trades")
 async def cmd_trades(ctx):
     if len(trades_today) == 0:
-        await ctx.send("No trades placed today yet.")
+        await send_embed(ctx, "📭 No Trades Today", 0x95a5a6, [("Info", "No automated trades have been placed today yet.", False)])
         return
-    msg = "**Trades Today:**\n"
-    for t in trades_today:
-        msg += t['side'].upper() + " " + t['symbol'] + " @ $" + str(round(t['price'], 2)) + " at " + t['time'][:19] + "\n"
-    await ctx.send(msg)
+    fields = []
+    for i, t in enumerate(trades_today):
+        fields.append(("Trade " + str(i+1), t['side'].upper() + " " + t['symbol'] + " @ $" + str(round(t['price'], 2)), True))
+        fields.append(("Time", t['time'][:19], True))
+        fields.append(("\u200b", "\u200b", True))
+    await send_embed(ctx, "📋 Trades Today — " + str(len(trades_today)) + "/" + str(config.MAX_TRADES_PER_DAY), 0x3498db, fields)
 
 @bot.command(name="positions")
 async def cmd_positions(ctx):
@@ -278,18 +462,19 @@ async def cmd_positions(ctx):
         headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
         resp = requests.get(base_url + "/v2/positions", headers=headers, timeout=10)
         positions = resp.json()
-        if len(positions) == 0:
-            await ctx.send("No open positions right now.")
+        if not isinstance(positions, list) or len(positions) == 0:
+            await send_embed(ctx, "📭 No Open Alpaca Positions", 0x95a5a6, [("Info", "No positions currently open in Alpaca.", False)])
             return
-        msg = "**Open Positions:**\n"
+        fields = []
         for p in positions:
-            msg += (p['symbol'] + " | " + p['side'].upper() + " | qty: " + str(p['qty']) +
-                    " | entry: $" + str(round(float(p['avg_entry_price']), 2)) +
-                    " | current: $" + str(round(float(p['current_price']), 2)) +
-                    " | P&L: $" + str(round(float(p['unrealized_pl']), 2)) + "\n")
-        await ctx.send(msg)
+            pnl = float(p['unrealized_pl'])
+            fields.append(("Symbol", p['symbol'], True))
+            fields.append(("Side", p['side'].upper(), True))
+            fields.append(("P&L", ("+" if pnl > 0 else "") + "$" + str(round(pnl, 2)), True))
+        color = 0x2ecc71 if sum(float(p['unrealized_pl']) for p in positions) > 0 else 0xe74c3c
+        await send_embed(ctx, "📊 Alpaca Open Positions", color, fields)
     except Exception as e:
-        await ctx.send("Error fetching positions: " + str(e))
+        await send_embed(ctx, "❌ Error Fetching Positions", 0xe74c3c, [("Error", str(e), False)])
 
 @bot.command(name="pnl")
 async def cmd_pnl(ctx):
@@ -302,38 +487,57 @@ async def cmd_pnl(ctx):
         last_eq = round(float(acct['last_equity']), 2)
         day_pnl = round(equity - last_eq, 2)
         pct = round((day_pnl / last_eq) * 100, 2)
-        msg = (
-            "**P&L Summary**\n"
-            "Account equity: $" + str(equity) + "\n"
-            "Today's P&L: $" + str(day_pnl) + " (" + str(pct) + "%)\n"
-            "Trades placed today: " + str(len(trades_today))
-        )
-        await ctx.send(msg)
+        color = 0x2ecc71 if day_pnl >= 0 else 0xe74c3c
+        await send_embed(ctx, "💵 P&L Summary", color, [
+            ("💼 Account Equity", "$" + str(equity), True),
+            ("📈 Today's P&L", ("+" if day_pnl > 0 else "") + "$" + str(day_pnl) + " (" + str(pct) + "%)", True),
+            ("📊 Trades Today", str(len(trades_today)), True),
+            ("📋 Mode", config.TRADING_MODE.upper(), True)
+        ])
     except Exception as e:
-        await ctx.send("Error fetching P&L: " + str(e))
+        await send_embed(ctx, "❌ Error Fetching P&L", 0xe74c3c, [("Error", str(e), False)])
 
 @bot.command(name="halt")
 async def cmd_halt(ctx):
     global system_halted
     system_halted = True
-    discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, "KILL SWITCH ACTIVATED via Discord command - trading halted.")
-    await ctx.send("Trading HALTED. Use /resume to restart.")
+    discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, None, {
+        "title": "🛑 KILL SWITCH ACTIVATED",
+        "color": 0xe74c3c,
+        "description": "All trading has been halted via Discord command.",
+        "footer": {"text": "Use /resume [password] to restart"}
+    })
+    await send_embed(ctx, "🛑 Trading HALTED", 0xe74c3c, [("Status", "All automated trading is now paused.", True), ("Resume", "Use /resume [password] to restart", False)])
 
 @bot.command(name="resume")
 async def cmd_resume(ctx, password: str = ""):
     global system_halted
     if password != config.MODE_SWITCH_PASSWORD:
-        await ctx.send("Wrong password. Use: /resume yourpassword")
+        await send_embed(ctx, "❌ Wrong Password", 0xe74c3c, [("Tip", "Use: /resume yourpassword", False)])
         return
     system_halted = False
-    discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, "Trading RESUMED via Discord command.")
-    await ctx.send("Trading resumed.")
+    discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, None, {
+        "title": "✅ Trading Resumed",
+        "color": 0x2ecc71,
+        "description": "System is back online and monitoring for signals.",
+        "footer": {"text": "Momentum Confluence Scalper"}
+    })
+    await send_embed(ctx, "✅ Trading Resumed", 0x2ecc71, [("Status", "Bot is back online and watching for signals.", False)])
 
 @bot.event
 async def on_ready():
     print("Discord bot online: " + str(bot.user))
-    discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, "Bot online. Commands ready: /status /check /btccheck /trades /positions /pnl /halt /resume")
+    discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, None, {
+        "title": "🤖 Bot Online",
+        "color": 0x2ecc71,
+        "description": "All systems running. Commands ready.",
+        "fields": [
+            {"name": "📊 Commands", "value": "/status /check /btccheck /buy /sell /close /position /trades /positions /pnl /halt /resume", "inline": False}
+        ],
+        "footer": {"text": "Momentum Confluence Scalper"}
+    })
 
+# ====== FLASK ROUTES ======
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -386,6 +590,7 @@ def status():
         "daily_pnl": daily_pnl
     })
 
+# ====== SCHEDULED JOBS ======
 def run_strategy_check():
     global system_halted, trades_today
     try:
@@ -468,14 +673,21 @@ def run_crypto_strategy_check():
                 elif current_price >= pos['stop_loss']:
                     hit_stop = True
             if hit_target or hit_stop:
-                result = "WIN" if hit_target else "LOSS"
+                result = "WIN 🏆" if hit_target else "LOSS 📉"
                 pnl = (current_price - pos['entry']) if pos['direction'] == "buy" else (pos['entry'] - current_price)
                 pnl_pct = (pnl / pos['entry']) * 100
-                discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES,
-                    content="[CRYPTO-SANDBOX RESULT] " + result + " - " + pos['direction'].upper() +
-                            " BTC-USD entered @ $" + str(round(pos['entry'], 2)) +
-                            ", closed @ $" + str(round(current_price, 2)) +
-                            " | Simulated P&L: $" + str(round(pnl, 2)) + " (" + str(round(pnl_pct, 2)) + "%)")
+                color = 0x2ecc71 if hit_target else 0xe74c3c
+                discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
+                    "title": "🏁 CRYPTO SANDBOX RESULT — " + result,
+                    "color": color,
+                    "fields": [
+                        {"name": "Direction", "value": pos['direction'].upper(), "inline": True},
+                        {"name": "Entry", "value": "$" + str(round(pos['entry'], 2)), "inline": True},
+                        {"name": "Exit", "value": "$" + str(round(current_price, 2)), "inline": True},
+                        {"name": "P&L", "value": ("+" if pnl > 0 else "") + "$" + str(round(pnl, 2)) + " (" + str(round(pnl_pct, 2)) + "%)", "inline": True}
+                    ],
+                    "footer": {"text": "Sandbox only — not a real trade"}
+                })
                 simulated_crypto_position = None
             return
         htf_bullish = float(df15.iloc[-1]['ema9']) > float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) > float(df60.iloc[-1]['ema21'])
@@ -491,20 +703,37 @@ def run_crypto_strategy_check():
         direction = "buy" if long_cond else "sell"
         stop_loss = current_price - atr * 1.5 if direction == "buy" else current_price + atr * 1.5
         take_profit = current_price + atr if direction == "buy" else current_price - atr
-        simulated_crypto_position = {"direction": direction, "entry": current_price, "stop_loss": stop_loss, "take_profit": take_profit}
-        discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES,
-            content="[CRYPTO-SANDBOX SIGNAL] " + direction.upper() + " BTC-USD @ $" + str(round(current_price, 2)) +
-                    " | Stop: $" + str(round(stop_loss, 2)) + " | Target: $" + str(round(take_profit, 2)) +
-                    " (tracking hypothetical outcome...)")
+        simulated_crypto_position = {"direction": direction, "entry": current_price, "stop_loss": stop_loss, "take_profit": take_profit, "symbol": "BTC-USD"}
+        discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
+            "title": ("🟢" if direction == "buy" else "🔴") + " CRYPTO SANDBOX SIGNAL — " + direction.upper() + " BTC-USD",
+            "color": 0x2ecc71 if direction == "buy" else 0xe74c3c,
+            "fields": [
+                {"name": "💰 Entry", "value": "$" + str(round(current_price, 2)), "inline": True},
+                {"name": "🛑 Stop", "value": "$" + str(round(stop_loss, 2)), "inline": True},
+                {"name": "🎯 Target", "value": "$" + str(round(take_profit, 2)), "inline": True},
+                {"name": "ℹ️ Info", "value": "Tracking hypothetical outcome...", "inline": False}
+            ],
+            "footer": {"text": "Sandbox only — not a real trade"}
+        })
     except Exception as e:
         traceback.print_exc()
         discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, "ERROR in crypto check: " + str(e))
 
 def market_open_alert():
-    discord_post(config.DISCORD_WEBHOOK_MARKET_HOURS, "Market is now OPEN")
+    discord_post(config.DISCORD_WEBHOOK_MARKET_HOURS, embed={
+        "title": "🟢 Market is OPEN",
+        "color": 0x2ecc71,
+        "description": "SPY trading hours have begun. Bot is now monitoring for signals.",
+        "footer": {"text": "Market Hours — 9:35 AM to 3:45 PM ET"}
+    })
 
 def market_close_alert():
-    discord_post(config.DISCORD_WEBHOOK_MARKET_HOURS, "Market is now CLOSED")
+    discord_post(config.DISCORD_WEBHOOK_MARKET_HOURS, embed={
+        "title": "🔴 Market is CLOSED",
+        "color": 0xe74c3c,
+        "description": "Trading hours have ended. See you tomorrow.",
+        "footer": {"text": "Momentum Confluence Scalper"}
+    })
 
 scheduler = BackgroundScheduler(timezone=pytz.timezone("America/New_York"))
 scheduler.add_job(run_strategy_check, "cron", day_of_week="mon-fri", minute="*/5", hour="9-15")
