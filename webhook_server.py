@@ -19,6 +19,11 @@ system_halted = False
 simulated_crypto_position = None
 manual_position = None
 
+# Tracks the timestamp of the last CLOSED candle that already triggered a
+# signal, so the lookback window below never fires twice on the same bar.
+last_spy_signal_time = None
+last_btc_signal_time = None
+
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
@@ -62,6 +67,8 @@ def calculate_indicators(df):
     return df
 
 def get_current_price_and_atr(symbol):
+    # Used by manual /buy /sell /close /position — these want the live price
+    # at the moment of execution, so the forming candle is fine to use here.
     try:
         df = yf.download(symbol, period="5d", interval="5m", progress=False)
         if isinstance(df.columns, pd.MultiIndex):
@@ -76,19 +83,22 @@ def get_current_price_and_atr(symbol):
         return None, None
 
 def get_spy_condition_details():
+    # Powers /check. Reads the last FULLY CLOSED candle so what the user sees
+    # always matches exactly what the automated checker is acting on.
     try:
         df5 = yf.download("SPY", period="5d", interval="5m", progress=False)
         df15 = yf.download("SPY", period="5d", interval="15m", progress=False)
         df60 = yf.download("SPY", period="10d", interval="60m", progress=False)
-        if len(df5) < 30 or len(df15) < 30 or len(df60) < 30:
+        if len(df5) < 31 or len(df15) < 30 or len(df60) < 30:
             return None
         df5 = calculate_indicators(df5)
         df15 = calculate_indicators(df15)
         df60 = calculate_indicators(df60)
-        last = df5.iloc[-1]
+        closed5 = df5.iloc[:-1]
+        last = closed5.iloc[-1]
         ny_tz = pytz.timezone("America/New_York")
         now = datetime.datetime.now(ny_tz)
-        today_session = df5[df5.index.date == now.date()]
+        today_session = closed5[closed5.index.date == now.date()]
         or_window = today_session.between_time("09:30", "10:00")
         or_high = float(or_window['High'].max()) if len(or_window) > 0 else None
         or_low = float(or_window['Low'].min()) if len(or_window) > 0 else None
@@ -98,6 +108,7 @@ def get_spy_condition_details():
             "vwap": float(last['vwap']), "volume": float(last['Volume']),
             "vol_avg": float(last['vol_avg']), "atr": float(last['atr']),
             "or_high": or_high, "or_low": or_low,
+            "candle_time": last.name,
             "htf_bull": float(df15.iloc[-1]['ema9']) > float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) > float(df60.iloc[-1]['ema21']),
             "htf_bear": float(df15.iloc[-1]['ema9']) < float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) < float(df60.iloc[-1]['ema21'])
         }
@@ -110,17 +121,19 @@ def get_btc_condition_details():
         df5 = yf.download("BTC-USD", period="5d", interval="5m", progress=False)
         df15 = yf.download("BTC-USD", period="5d", interval="15m", progress=False)
         df60 = yf.download("BTC-USD", period="10d", interval="60m", progress=False)
-        if len(df5) < 30 or len(df15) < 30 or len(df60) < 30:
+        if len(df5) < 31 or len(df15) < 30 or len(df60) < 30:
             return None
         df5 = calculate_indicators(df5)
         df15 = calculate_indicators(df15)
         df60 = calculate_indicators(df60)
-        last = df5.iloc[-1]
+        closed5 = df5.iloc[:-1]
+        last = closed5.iloc[-1]
         return {
             "close": float(last['Close']), "ema9": float(last['ema9']),
             "ema21": float(last['ema21']), "rsi": float(last['rsi']),
             "vwap": float(last['vwap']), "volume": float(last['Volume']),
             "vol_avg": float(last['vol_avg']), "atr": float(last['atr']),
+            "candle_time": last.name,
             "htf_bull": float(df15.iloc[-1]['ema9']) > float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) > float(df60.iloc[-1]['ema21']),
             "htf_bear": float(df15.iloc[-1]['ema9']) < float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) < float(df60.iloc[-1]['ema21'])
         }
@@ -179,13 +192,6 @@ def process_trade_signal(data):
     discord_post(target_channel, embed=embed)
     discord_post(config.DISCORD_WEBHOOK_TRADE_ALERTS, embed=embed)
 
-def make_embed(title, color, fields, footer="Momentum Confluence Scalper"):
-    return discord.Embed(
-        title=title,
-        color=color,
-        timestamp=datetime.datetime.utcnow()
-    ).set_footer(text=footer)
-
 async def send_embed(ctx, title, color, fields, footer="Momentum Confluence Scalper"):
     embed = discord.Embed(title=title, color=color, timestamp=datetime.datetime.utcnow())
     for name, value, inline in fields:
@@ -210,7 +216,7 @@ async def cmd_status(ctx):
 
 @bot.command(name="check")
 async def cmd_check(ctx):
-    checking = discord.Embed(title="🔍 Checking SPY...", color=0xf39c12, description="Fetching live conditions, give me a few seconds...")
+    checking = discord.Embed(title="🔍 Checking SPY...", color=0xf39c12, description="Fetching the last closed candle, give me a few seconds...")
     await ctx.send(embed=checking)
     d = get_spy_condition_details()
     if d is None:
@@ -244,12 +250,13 @@ async def cmd_check(ctx):
         ("Volume Spike", yn(vol_ok), True),
         ("Below OR Low", yn(or_bear), True),
         ("HTF Bearish", yn(d['htf_bear']), True),
+        ("📍 Candle Used", str(d['candle_time'])[:16] + " (last closed bar)", False),
         ("⚡ Trigger", "Need ALL 6 to fire a trade", False)
     ])
 
 @bot.command(name="btccheck")
 async def cmd_btccheck(ctx):
-    checking = discord.Embed(title="🔍 Checking BTC-USD...", color=0xf39c12, description="Fetching live conditions, give me a few seconds...")
+    checking = discord.Embed(title="🔍 Checking BTC-USD...", color=0xf39c12, description="Fetching the last closed candle, give me a few seconds...")
     await ctx.send(embed=checking)
     d = get_btc_condition_details()
     if d is None:
@@ -279,6 +286,7 @@ async def cmd_btccheck(ctx):
         ("RSI 35-55", yn(rsi_bear) + " (" + str(round(d['rsi'], 1)) + ")", True),
         ("Volume Spike", yn(vol_ok), True),
         ("HTF Bearish", yn(d['htf_bear']), True),
+        ("📍 Candle Used", str(d['candle_time'])[:16] + " (last closed bar)", False),
         ("⚡ Trigger", "Need ALL 5 to fire a sandbox signal", False)
     ])
 
@@ -315,7 +323,7 @@ async def cmd_buy(ctx):
         ("📈 Reward", "$" + str(round(take_profit - price, 2)) + " per unit", True),
         ("⚖️ R:R Ratio", "1:2", True),
         ("📋 Mode", "SANDBOX — not sent to Alpaca", False),
-        ("ℹ️ Info", "Bot will track this and post result when stop or target is hit. Use /close to exit early.", False)
+        ("ℹ️ Info", "This is tracked separately from the auto-bot. Use /close to exit manually — it does not auto-close.", False)
     ])
     discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
         "title": "🟢 MANUAL BUY — " + symbol,
@@ -361,7 +369,7 @@ async def cmd_sell(ctx):
         ("📈 Reward", "$" + str(round(price - take_profit, 2)) + " per unit", True),
         ("⚖️ R:R Ratio", "1:2", True),
         ("📋 Mode", "SANDBOX — not sent to Alpaca", False),
-        ("ℹ️ Info", "Bot will track this and post result when stop or target is hit. Use /close to exit early.", False)
+        ("ℹ️ Info", "This is tracked separately from the auto-bot. Use /close to exit manually — it does not auto-close.", False)
     ])
     discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
         "title": "🔴 MANUAL SELL — " + symbol,
@@ -592,7 +600,7 @@ def status():
 
 # ====== SCHEDULED JOBS ======
 def run_strategy_check():
-    global system_halted, trades_today
+    global system_halted, trades_today, last_spy_signal_time
     try:
         ny_tz = pytz.timezone("America/New_York")
         now = datetime.datetime.now(ny_tz)
@@ -609,112 +617,146 @@ def run_strategy_check():
         df5 = yf.download("SPY", period="5d", interval="5m", progress=False)
         df15 = yf.download("SPY", period="5d", interval="15m", progress=False)
         df60 = yf.download("SPY", period="10d", interval="60m", progress=False)
-        if len(df5) < 30 or len(df15) < 30 or len(df60) < 30:
+        if len(df5) < 31 or len(df15) < 30 or len(df60) < 30:
             return
         df5 = calculate_indicators(df5)
         df15 = calculate_indicators(df15)
         df60 = calculate_indicators(df60)
-        last = df5.iloc[-1]
+
+        # Only ever act on candles that have fully closed.
+        closed = df5.iloc[:-1]
+
         htf_bullish = float(df15.iloc[-1]['ema9']) > float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) > float(df60.iloc[-1]['ema21'])
         htf_bearish = float(df15.iloc[-1]['ema9']) < float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) < float(df60.iloc[-1]['ema21'])
-        today_session = df5[df5.index.date == now.date()]
+
+        today_session = closed[closed.index.date == now.date()]
         or_window = today_session.between_time("09:30", "10:00")
         if len(or_window) == 0:
             return
         or_high = float(or_window['High'].max())
         or_low = float(or_window['Low'].min())
-        vol_spike = float(last['Volume']) > float(last['vol_avg']) * 1.5
-        close = float(last['Close'])
-        long_cond = (float(last['ema9']) > float(last['ema21']) and close > float(last['vwap']) and
-                     45 < float(last['rsi']) < 65 and vol_spike and close > or_high and htf_bullish)
-        short_cond = (float(last['ema9']) < float(last['ema21']) and close < float(last['vwap']) and
-                      35 < float(last['rsi']) < 55 and vol_spike and close < or_low and htf_bearish)
-        if not long_cond and not short_cond:
-            return
-        atr = float(last['atr'])
-        action = "buy" if long_cond else "sell"
-        stop_loss = close - atr * 1.5 if action == "buy" else close + atr * 1.5
-        tp1 = close + atr if action == "buy" else close - atr
-        process_trade_signal({
-            "symbol": "SPY", "action": action, "price": close,
-            "stop_loss": stop_loss, "take_profit_1": tp1, "mode": config.TRADING_MODE
-        })
+
+        # Look back across the last 3 closed candles so a setup that fires
+        # between two scheduler ticks doesn't get silently skipped.
+        lookback = closed.tail(3)
+        for ts, row in lookback.iterrows():
+            if last_spy_signal_time is not None and ts <= last_spy_signal_time:
+                continue
+            close = float(row['Close'])
+            vol_spike = float(row['Volume']) > float(row['vol_avg']) * 1.5
+            long_cond = (float(row['ema9']) > float(row['ema21']) and close > float(row['vwap']) and
+                         45 < float(row['rsi']) < 65 and vol_spike and close > or_high and htf_bullish)
+            short_cond = (float(row['ema9']) < float(row['ema21']) and close < float(row['vwap']) and
+                          35 < float(row['rsi']) < 55 and vol_spike and close < or_low and htf_bearish)
+            if not long_cond and not short_cond:
+                continue
+            atr = float(row['atr'])
+            action = "buy" if long_cond else "sell"
+            stop_loss = close - atr * 1.5 if action == "buy" else close + atr * 1.5
+            tp1 = close + atr if action == "buy" else close - atr
+            last_spy_signal_time = ts
+            process_trade_signal({
+                "symbol": "SPY", "action": action, "price": close,
+                "stop_loss": stop_loss, "take_profit_1": tp1, "mode": config.TRADING_MODE
+            })
+            break
     except Exception as e:
         traceback.print_exc()
         discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, "ERROR in strategy check: " + str(e))
 
 def run_crypto_strategy_check():
-    global system_halted, simulated_crypto_position
+    global system_halted, simulated_crypto_position, last_btc_signal_time
     try:
         if system_halted:
             return
         df5 = yf.download("BTC-USD", period="5d", interval="5m", progress=False)
         df15 = yf.download("BTC-USD", period="5d", interval="15m", progress=False)
         df60 = yf.download("BTC-USD", period="10d", interval="60m", progress=False)
-        if len(df5) < 30 or len(df15) < 30 or len(df60) < 30:
+        if len(df5) < 31 or len(df15) < 30 or len(df60) < 30:
             return
         df5 = calculate_indicators(df5)
         df15 = calculate_indicators(df15)
         df60 = calculate_indicators(df60)
-        last = df5.iloc[-1]
-        current_price = float(last['Close'])
+        closed = df5.iloc[:-1]
+
+        # Manage an open simulated position first, using High/Low so a stop
+        # or target touched intra-candle isn't missed just because price
+        # drifted back by the time the next check runs.
         if simulated_crypto_position is not None:
             pos = simulated_crypto_position
-            hit_target = False
-            hit_stop = False
-            if pos['direction'] == "buy":
-                if current_price >= pos['take_profit']:
-                    hit_target = True
-                elif current_price <= pos['stop_loss']:
-                    hit_stop = True
-            else:
-                if current_price <= pos['take_profit']:
-                    hit_target = True
-                elif current_price >= pos['stop_loss']:
-                    hit_stop = True
-            if hit_target or hit_stop:
-                result = "WIN 🏆" if hit_target else "LOSS 📉"
-                pnl = (current_price - pos['entry']) if pos['direction'] == "buy" else (pos['entry'] - current_price)
-                pnl_pct = (pnl / pos['entry']) * 100
-                color = 0x2ecc71 if hit_target else 0xe74c3c
-                discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
-                    "title": "🏁 CRYPTO SANDBOX RESULT — " + result,
-                    "color": color,
-                    "fields": [
-                        {"name": "Direction", "value": pos['direction'].upper(), "inline": True},
-                        {"name": "Entry", "value": "$" + str(round(pos['entry'], 2)), "inline": True},
-                        {"name": "Exit", "value": "$" + str(round(current_price, 2)), "inline": True},
-                        {"name": "P&L", "value": ("+" if pnl > 0 else "") + "$" + str(round(pnl, 2)) + " (" + str(round(pnl_pct, 2)) + "%)", "inline": True}
-                    ],
-                    "footer": {"text": "Sandbox only — not a real trade"}
-                })
-                simulated_crypto_position = None
+            since_entry = closed[closed.index > pos['opened_at']]
+            for ts, row in since_entry.iterrows():
+                high = float(row['High'])
+                low = float(row['Low'])
+                hit_target = False
+                hit_stop = False
+                if pos['direction'] == "buy":
+                    if high >= pos['take_profit']:
+                        hit_target = True
+                    elif low <= pos['stop_loss']:
+                        hit_stop = True
+                else:
+                    if low <= pos['take_profit']:
+                        hit_target = True
+                    elif high >= pos['stop_loss']:
+                        hit_stop = True
+                if hit_target or hit_stop:
+                    result = "WIN 🏆" if hit_target else "LOSS 📉"
+                    exit_price = pos['take_profit'] if hit_target else pos['stop_loss']
+                    pnl = (exit_price - pos['entry']) if pos['direction'] == "buy" else (pos['entry'] - exit_price)
+                    pnl_pct = (pnl / pos['entry']) * 100
+                    color = 0x2ecc71 if hit_target else 0xe74c3c
+                    discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
+                        "title": "🏁 CRYPTO SANDBOX RESULT — " + result,
+                        "color": color,
+                        "fields": [
+                            {"name": "Direction", "value": pos['direction'].upper(), "inline": True},
+                            {"name": "Entry", "value": "$" + str(round(pos['entry'], 2)), "inline": True},
+                            {"name": "Exit", "value": "$" + str(round(exit_price, 2)), "inline": True},
+                            {"name": "P&L", "value": ("+" if pnl > 0 else "") + "$" + str(round(pnl, 2)) + " (" + str(round(pnl_pct, 2)) + "%)", "inline": True}
+                        ],
+                        "footer": {"text": "Sandbox only — not a real trade"}
+                    })
+                    simulated_crypto_position = None
+                    break
             return
+
         htf_bullish = float(df15.iloc[-1]['ema9']) > float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) > float(df60.iloc[-1]['ema21'])
         htf_bearish = float(df15.iloc[-1]['ema9']) < float(df15.iloc[-1]['ema21']) and float(df60.iloc[-1]['ema9']) < float(df60.iloc[-1]['ema21'])
-        vol_spike = float(last['Volume']) > float(last['vol_avg']) * 1.5
-        long_cond = (float(last['ema9']) > float(last['ema21']) and current_price > float(last['vwap']) and
-                     45 < float(last['rsi']) < 65 and vol_spike and htf_bullish)
-        short_cond = (float(last['ema9']) < float(last['ema21']) and current_price < float(last['vwap']) and
-                      35 < float(last['rsi']) < 55 and vol_spike and htf_bearish)
-        if not long_cond and not short_cond:
-            return
-        atr = float(last['atr'])
-        direction = "buy" if long_cond else "sell"
-        stop_loss = current_price - atr * 1.5 if direction == "buy" else current_price + atr * 1.5
-        take_profit = current_price + atr if direction == "buy" else current_price - atr
-        simulated_crypto_position = {"direction": direction, "entry": current_price, "stop_loss": stop_loss, "take_profit": take_profit, "symbol": "BTC-USD"}
-        discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
-            "title": ("🟢" if direction == "buy" else "🔴") + " CRYPTO SANDBOX SIGNAL — " + direction.upper() + " BTC-USD",
-            "color": 0x2ecc71 if direction == "buy" else 0xe74c3c,
-            "fields": [
-                {"name": "💰 Entry", "value": "$" + str(round(current_price, 2)), "inline": True},
-                {"name": "🛑 Stop", "value": "$" + str(round(stop_loss, 2)), "inline": True},
-                {"name": "🎯 Target", "value": "$" + str(round(take_profit, 2)), "inline": True},
-                {"name": "ℹ️ Info", "value": "Tracking hypothetical outcome...", "inline": False}
-            ],
-            "footer": {"text": "Sandbox only — not a real trade"}
-        })
+
+        lookback = closed.tail(3)
+        for ts, row in lookback.iterrows():
+            if last_btc_signal_time is not None and ts <= last_btc_signal_time:
+                continue
+            current_price = float(row['Close'])
+            vol_spike = float(row['Volume']) > float(row['vol_avg']) * 1.5
+            long_cond = (float(row['ema9']) > float(row['ema21']) and current_price > float(row['vwap']) and
+                         45 < float(row['rsi']) < 65 and vol_spike and htf_bullish)
+            short_cond = (float(row['ema9']) < float(row['ema21']) and current_price < float(row['vwap']) and
+                          35 < float(row['rsi']) < 55 and vol_spike and htf_bearish)
+            if not long_cond and not short_cond:
+                continue
+            atr = float(row['atr'])
+            direction = "buy" if long_cond else "sell"
+            stop_loss = current_price - atr * 1.5 if direction == "buy" else current_price + atr * 1.5
+            take_profit = current_price + atr if direction == "buy" else current_price - atr
+            last_btc_signal_time = ts
+            simulated_crypto_position = {
+                "direction": direction, "entry": current_price, "stop_loss": stop_loss,
+                "take_profit": take_profit, "symbol": "BTC-USD", "opened_at": ts
+            }
+            discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
+                "title": ("🟢" if direction == "buy" else "🔴") + " CRYPTO SANDBOX SIGNAL — " + direction.upper() + " BTC-USD",
+                "color": 0x2ecc71 if direction == "buy" else 0xe74c3c,
+                "fields": [
+                    {"name": "💰 Entry", "value": "$" + str(round(current_price, 2)), "inline": True},
+                    {"name": "🛑 Stop", "value": "$" + str(round(stop_loss, 2)), "inline": True},
+                    {"name": "🎯 Target", "value": "$" + str(round(take_profit, 2)), "inline": True},
+                    {"name": "ℹ️ Info", "value": "Tracking hypothetical outcome (candle: " + str(ts)[:16] + ")", "inline": False}
+                ],
+                "footer": {"text": "Sandbox only — not a real trade"}
+            })
+            break
     except Exception as e:
         traceback.print_exc()
         discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, "ERROR in crypto check: " + str(e))
