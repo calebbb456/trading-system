@@ -18,7 +18,6 @@ consecutive_losses = 0
 system_halted = False
 simulated_crypto_position = None
 
-# ====== DISCORD BOT SETUP ======
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
@@ -43,6 +42,8 @@ def get_alpaca_creds():
 
 def calculate_indicators(df):
     df = df.copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     df['ema9'] = df['Close'].ewm(span=9, adjust=False).mean()
     df['ema21'] = df['Close'].ewm(span=21, adjust=False).mean()
     delta = df['Close'].diff()
@@ -174,7 +175,6 @@ def process_trade_signal(data):
     discord_post(target_channel, embed=embed)
     discord_post(config.DISCORD_WEBHOOK_TRADE_ALERTS, embed=embed)
 
-# ====== DISCORD BOT COMMANDS ======
 @bot.command(name="status")
 async def cmd_status(ctx):
     halted_text = "HALTED" if system_halted else "Running"
@@ -334,7 +334,6 @@ async def on_ready():
     print("Discord bot online: " + str(bot.user))
     discord_post(config.DISCORD_WEBHOOK_SYSTEM_STATUS, "Bot online. Commands ready: /status /check /btccheck /trades /positions /pnl /halt /resume")
 
-# ====== FLASK ROUTES ======
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -387,7 +386,6 @@ def status():
         "daily_pnl": daily_pnl
     })
 
-# ====== SCHEDULED JOBS ======
 def run_strategy_check():
     global system_halted, trades_today
     try:
