@@ -308,106 +308,118 @@ async def send_embed(ctx, title, color, fields, footer="Momentum Confluence Scal
 async def live_pnl_loop(channel, pos_snapshot):
     """
     Edits the live P&L message every 5 seconds while manual_position is open.
-    Automatically stops when the position is closed (manually or by stop/target).
-    Also handles auto-close at stop/target for BTC (which Alpaca doesn't bracket).
+    Resilient version: catches all exceptions per iteration so one bad tick
+    never kills the whole loop.
     """
     global manual_position, live_pnl_message
 
-    is_crypto = "-USD" in pos_snapshot['symbol'] or "-" in pos_snapshot['symbol']
-    symbol = pos_snapshot['symbol']
-    direction = pos_snapshot['direction']
-    entry = pos_snapshot['entry']
-    stop_loss = pos_snapshot['stop_loss']
-    take_profit = pos_snapshot['take_profit']
+    is_crypto = "-USD" in pos_snapshot["symbol"] or "-" in pos_snapshot["symbol"]
+    symbol = pos_snapshot["symbol"]
+    direction = pos_snapshot["direction"]
+    entry = pos_snapshot["entry"]
+    stop_loss = pos_snapshot["stop_loss"]
+    take_profit = pos_snapshot["take_profit"]
+    last_price = entry  # fallback so embed always has a number
+    tick = 0
 
     while True:
-        await asyncio.sleep(5)
-
-        # Position was already closed externally (e.g. /close command)
-        if manual_position is None:
-            break
-
-        price = get_live_alpaca_price(symbol)
-        if price is None:
-            continue
-
-        if direction == "buy":
-            pnl = price - entry
-        else:
-            pnl = entry - price
-        pnl_pct = (pnl / entry) * 100
-        is_profit = pnl >= 0
-        color = 0x2ecc71 if is_profit else 0xe74c3c
-        pnl_sign = "+" if pnl >= 0 else ""
-
-        # Check stop/target for crypto (equity brackets handled by Alpaca)
-        auto_closed = False
-        close_reason = ""
-        if is_crypto:
-            if direction == "buy":
-                if price >= take_profit:
-                    auto_closed = True
-                    close_reason = "🎯 Take Profit Hit"
-                elif price <= stop_loss:
-                    auto_closed = True
-                    close_reason = "🛑 Stop Loss Hit"
-            else:
-                if price <= take_profit:
-                    auto_closed = True
-                    close_reason = "🎯 Take Profit Hit"
-                elif price >= stop_loss:
-                    auto_closed = True
-                    close_reason = "🛑 Stop Loss Hit"
-
-        # Build the embed
-        now_str = datetime.datetime.now(pytz.timezone("America/New_York")).strftime("%I:%M:%S %p ET")
-        title = ("🟢 " if is_profit else "🔴 ") + ("LONG" if direction == "buy" else "SHORT") + " " + symbol + " — LIVE"
-        if auto_closed:
-            title = close_reason + " — " + symbol
-
-        embed = discord.Embed(title=title, color=color, timestamp=datetime.datetime.utcnow())
-        embed.add_field(name="💰 Entry", value="$" + str(round(entry, 2)), inline=True)
-        embed.add_field(name="📡 Current Price", value="$" + str(round(price, 2)), inline=True)
-        embed.add_field(name="💵 Unrealized P&L",
-                        value=pnl_sign + "$" + str(round(pnl, 2)) + " (" + pnl_sign + str(round(pnl_pct, 2)) + "%)",
-                        inline=True)
-        embed.add_field(name="🛑 Stop Loss", value="$" + str(round(stop_loss, 2)), inline=True)
-        embed.add_field(name="🎯 Take Profit", value="$" + str(round(take_profit, 2)), inline=True)
-        embed.add_field(name="🕐 Updated", value=now_str, inline=True)
-        if auto_closed:
-            embed.add_field(name="✅ Status", value="Position auto-closed", inline=False)
-        else:
-            embed.add_field(name="ℹ️ Close", value="Use /close to exit early", inline=False)
-        embed.set_footer(text="Updates every 5s • Momentum Confluence Scalper")
-
         try:
-            if live_pnl_message is not None:
-                await live_pnl_message.edit(embed=embed)
-        except Exception:
-            pass  # message may have been deleted
+            await asyncio.sleep(5)
+            tick += 1
 
-        if auto_closed:
-            # Close on Alpaca and clear position
-            close_alpaca_position(symbol)
-            result_pnl = pnl
-            manual_position = None
-            live_pnl_message = None
-            # Post final result to paper trades channel
-            result_label = "WIN 🏆" if result_pnl > 0 else "LOSS 📉"
-            discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
-                "title": "🏁 POSITION CLOSED — " + result_label,
-                "color": 0x2ecc71 if result_pnl > 0 else 0xe74c3c,
-                "fields": [
-                    {"name": "Symbol", "value": symbol, "inline": True},
-                    {"name": "Direction", "value": direction.upper(), "inline": True},
-                    {"name": "Reason", "value": close_reason, "inline": True},
-                    {"name": "Entry", "value": "$" + str(round(entry, 2)), "inline": True},
-                    {"name": "Exit", "value": "$" + str(round(price, 2)), "inline": True},
-                    {"name": "P&L", "value": ("+" if result_pnl > 0 else "") + "$" + str(round(result_pnl, 2)), "inline": True}
-                ],
-                "footer": {"text": "Alpaca paper account"}
-            })
+            # Position was closed externally (e.g. /close command)
+            if manual_position is None:
+                break
+
+            # Fetch price — try Alpaca first, yfinance fallback
+            fetched = get_live_alpaca_price(symbol)
+            if fetched is not None:
+                last_price = fetched
+            price = last_price
+
+            if direction == "buy":
+                pnl = price - entry
+            else:
+                pnl = entry - price
+            pnl_pct = (pnl / entry) * 100
+            is_profit = pnl >= 0
+            color = 0x2ecc71 if is_profit else 0xe74c3c
+            pnl_sign = "+" if pnl >= 0 else ""
+
+            # Check stop/target for crypto (equity brackets handled by Alpaca)
+            auto_closed = False
+            close_reason = ""
+            if is_crypto:
+                if direction == "buy":
+                    if price >= take_profit:
+                        auto_closed = True
+                        close_reason = "🎯 Take Profit Hit"
+                    elif price <= stop_loss:
+                        auto_closed = True
+                        close_reason = "🛑 Stop Loss Hit"
+                else:
+                    if price <= take_profit:
+                        auto_closed = True
+                        close_reason = "🎯 Take Profit Hit"
+                    elif price >= stop_loss:
+                        auto_closed = True
+                        close_reason = "🛑 Stop Loss Hit"
+
+            now_str = datetime.datetime.now(pytz.timezone("America/New_York")).strftime("%I:%M:%S %p ET")
+            title = ("🟢 " if is_profit else "🔴 ") + ("LONG" if direction == "buy" else "SHORT") + " " + symbol + " — LIVE"
+            if auto_closed:
+                title = close_reason + " — " + symbol
+
+            embed = discord.Embed(title=title, color=color, timestamp=datetime.datetime.utcnow())
+            embed.add_field(name="💰 Entry", value="$" + str(round(entry, 2)), inline=True)
+            embed.add_field(name="📡 Current Price", value="$" + str(round(price, 2)), inline=True)
+            embed.add_field(name="💵 Unrealized P&L",
+                            value=pnl_sign + "$" + str(round(pnl, 2)) + " (" + pnl_sign + str(round(pnl_pct, 2)) + "%)",
+                            inline=True)
+            embed.add_field(name="🛑 Stop Loss", value="$" + str(round(stop_loss, 2)), inline=True)
+            embed.add_field(name="🎯 Take Profit", value="$" + str(round(take_profit, 2)), inline=True)
+            embed.add_field(name="🕐 Updated", value=now_str + " (tick " + str(tick) + ")", inline=True)
+            if auto_closed:
+                embed.add_field(name="✅ Status", value="Position auto-closed", inline=False)
+            else:
+                embed.add_field(name="ℹ️ Close", value="Use /close to exit early", inline=False)
+            embed.set_footer(text="Updates every 5s • Momentum Confluence Scalper")
+
+            if live_pnl_message is not None:
+                try:
+                    await live_pnl_message.edit(embed=embed)
+                except discord.errors.NotFound:
+                    break  # message was deleted, stop the loop
+                except Exception:
+                    pass  # rate limit or transient error, keep going
+
+            if auto_closed:
+                close_alpaca_position(symbol)
+                result_pnl = pnl
+                manual_position = None
+                live_pnl_message = None
+                result_label = "WIN 🏆" if result_pnl > 0 else "LOSS 📉"
+                discord_post(config.DISCORD_WEBHOOK_PAPER_TRADES, embed={
+                    "title": "🏁 POSITION CLOSED — " + result_label,
+                    "color": 0x2ecc71 if result_pnl > 0 else 0xe74c3c,
+                    "fields": [
+                        {"name": "Symbol", "value": symbol, "inline": True},
+                        {"name": "Direction", "value": direction.upper(), "inline": True},
+                        {"name": "Reason", "value": close_reason, "inline": True},
+                        {"name": "Entry", "value": "$" + str(round(entry, 2)), "inline": True},
+                        {"name": "Exit", "value": "$" + str(round(price, 2)), "inline": True},
+                        {"name": "P&L", "value": ("+" if result_pnl > 0 else "") + "$" + str(round(result_pnl, 2)), "inline": True}
+                    ],
+                    "footer": {"text": "Alpaca paper account"}
+                })
+                break
+
+        except asyncio.CancelledError:
             break
+        except Exception as e:
+            print("live_pnl_loop error (tick " + str(tick) + "): " + str(e))
+            await asyncio.sleep(5)
+            continue
 
     live_pnl_message = None
 
