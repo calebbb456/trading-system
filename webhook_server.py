@@ -95,19 +95,22 @@ def place_alpaca_order(symbol, side, qty, stop_loss, take_profit):
         return None, str(e)
 
 def close_alpaca_position(symbol):
-    """Close an open Alpaca position by symbol. Returns error string or None."""
+    """Close an open Alpaca position. Tries multiple symbol formats for crypto."""
     key, secret, base_url = get_alpaca_creds()
     if not key or not secret:
         return "Missing Alpaca credentials"
     headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
-    alpaca_symbol = symbol.replace("-", "/") if "-USD" in symbol else symbol
-    try:
-        resp = requests.delete(base_url + "/v2/positions/" + alpaca_symbol, headers=headers, timeout=10)
-        if resp.status_code in (200, 204):
-            return None
-        return str(resp.text)
-    except Exception as e:
-        return str(e)
+    symbols_to_try = [symbol]
+    if "-" in symbol:
+        symbols_to_try = [symbol.replace("-", "/"), symbol.replace("-", ""), symbol]
+    for sym in symbols_to_try:
+        try:
+            resp = requests.delete(base_url + "/v2/positions/" + sym, headers=headers, timeout=10)
+            if resp.status_code in (200, 204):
+                return None
+        except Exception as e:
+            return str(e)
+    return "Could not close — check Alpaca dashboard manually" 
 
 def get_live_alpaca_price(symbol):
     """Get latest price from Alpaca for a symbol (real-time for live ticker)."""
@@ -719,6 +722,87 @@ async def cmd_position(ctx):
         ("💵 Unrealized P&L", ("+" if pnl > 0 else "") + "$" + str(round(pnl, 2)) + " (" + str(round(pnl_pct, 2)) + "%)", True),
         ("🕐 Opened At", pos['time'][:19], False),
         ("📋 Alpaca", "Real paper order — check Alpaca dashboard for bracket status", False)
+    ])
+
+
+@bot.command(name="advice")
+async def cmd_advice(ctx):
+    checking = discord.Embed(title="🧠 Analyzing market...", color=0xf39c12,
+        description="Checking all conditions to give you a recommendation...")
+    await ctx.send(embed=checking)
+    ny_tz = pytz.timezone("America/New_York")
+    now = datetime.datetime.now(ny_tz)
+    is_weekend = now.weekday() >= 5
+    symbol = "BTC-USD" if is_weekend else "SPY"
+    if is_weekend:
+        d = get_btc_condition_details()
+        if d is None:
+            await send_embed(ctx, "❌ Data Unavailable", 0xe74c3c, [("Error", "Could not fetch BTC data.", False)])
+            return
+        ema_bull = d["ema9"] > d["ema21"]
+        above_vwap = d["close"] > d["vwap"]
+        rsi_bull = 45 < d["rsi"] < 65
+        rsi_bear = 35 < d["rsi"] < 55
+        vol_ok = d["volume"] > d["vol_avg"] * 1.5
+        long_score = sum([ema_bull, above_vwap, rsi_bull, vol_ok, d["htf_bull"]])
+        short_score = sum([not ema_bull, not above_vwap, rsi_bear, vol_ok, d["htf_bear"]])
+        total = 5
+    else:
+        d = get_spy_condition_details()
+        if d is None:
+            await send_embed(ctx, "❌ Data Unavailable", 0xe74c3c, [("Error", "Could not fetch SPY data. Market may be closed.", False)])
+            return
+        ema_bull = d["ema9"] > d["ema21"]
+        above_vwap = d["close"] > d["vwap"]
+        rsi_bull = 45 < d["rsi"] < 65
+        rsi_bear = 35 < d["rsi"] < 55
+        vol_ok = d["volume"] > d["vol_avg"] * 1.5
+        or_bull = d["or_high"] is not None and d["close"] > d["or_high"]
+        or_bear = d["or_low"] is not None and d["close"] < d["or_low"]
+        long_score = sum([ema_bull, above_vwap, rsi_bull, vol_ok, or_bull, d["htf_bull"]])
+        short_score = sum([not ema_bull, not above_vwap, rsi_bear, vol_ok, or_bear, d["htf_bear"]])
+        total = 6
+
+    go_long = long_score >= short_score
+    winner_score = long_score if go_long else short_score
+    direction = "BUY" if go_long else "SELL"
+    color = 0x2ecc71 if go_long else 0xe74c3c
+    icon = "🟢" if go_long else "🔴"
+
+    diff = winner_score - (short_score if go_long else long_score)
+    if diff >= 3:
+        confidence = "🔥 Strong"
+    elif diff >= 1:
+        confidence = "⚡ Moderate"
+    else:
+        confidence = "⚠️ Weak — trade carefully"
+
+    reasons = []
+    if go_long:
+        reasons.append("✅ EMA trending up" if ema_bull else "❌ EMA not aligned for long")
+        reasons.append("✅ Price above VWAP" if above_vwap else "❌ Price below VWAP")
+        reasons.append("✅ RSI bullish (" + str(round(d["rsi"], 1)) + ")" if rsi_bull else "⚠️ RSI at " + str(round(d["rsi"], 1)))
+        reasons.append("✅ Volume spike confirmed" if vol_ok else "❌ No volume spike")
+        reasons.append("✅ Higher timeframe bullish" if d["htf_bull"] else "❌ HTF not bullish")
+        if not is_weekend:
+            reasons.append("✅ Above opening range high" if or_bull else "❌ Not above OR high")
+    else:
+        reasons.append("✅ EMA trending down" if not ema_bull else "❌ EMA not aligned for short")
+        reasons.append("✅ Price below VWAP" if not above_vwap else "❌ Price above VWAP")
+        reasons.append("✅ RSI bearish (" + str(round(d["rsi"], 1)) + ")" if rsi_bear else "⚠️ RSI at " + str(round(d["rsi"], 1)))
+        reasons.append("✅ Volume spike confirmed" if vol_ok else "❌ No volume spike")
+        reasons.append("✅ Higher timeframe bearish" if d["htf_bear"] else "❌ HTF not bearish")
+        if not is_weekend:
+            reasons.append("✅ Below opening range low" if or_bear else "❌ Not below OR low")
+
+    await send_embed(ctx, icon + " Advice: " + direction + " " + symbol, color, [
+        ("📊 Recommendation", direction + " " + symbol, True),
+        ("💪 Confidence", confidence, True),
+        ("📈 Score", str(winner_score) + "/" + str(total) + " conditions favor " + direction, True),
+        ("🔍 Reasoning", "\n".join(reasons), False),
+        ("💰 Current Price", "$" + str(round(d["close"], 2)), True),
+        ("📍 Based On", str(d["candle_time"])[:16] + " (last closed bar)", True),
+        ("⚠️ Reminder", "Not financial advice. You are overriding the bot — trade at your own risk.", False)
     ])
 
 @bot.command(name="trades")
