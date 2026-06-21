@@ -5,3 +5,4 @@ pytz
 yfinance
 pandas
 numpy
+discord.py
