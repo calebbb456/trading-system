@@ -113,38 +113,57 @@ def close_alpaca_position(symbol):
     return "Could not close — check Alpaca dashboard manually" 
 
 def get_live_alpaca_price(symbol):
-    """Get latest price from Alpaca for a symbol (real-time for live ticker)."""
+    """Get latest price. Tries multiple Alpaca endpoints then yfinance fallback."""
     key, secret, base_url = get_alpaca_creds()
-    if not key or not secret:
-        return None
-    headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
-    alpaca_symbol = symbol.replace("-", "/") if "-USD" in symbol else symbol
-    try:
-        # Use the latest quote/trade endpoint
-        data_url = "https://data.alpaca.markets"
-        if "-" in symbol:
-            resp = requests.get(data_url + "/v1beta3/crypto/us/latest/trades?symbols=" + alpaca_symbol,
-                                headers=headers, timeout=5)
+    headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret} if key else {}
+    is_crypto = "-" in symbol
+
+    if key and is_crypto:
+        # Try Alpaca crypto latest trade (most real-time)
+        alpaca_symbol = symbol.replace("-", "/")
+        try:
+            resp = requests.get(
+                "https://data.alpaca.markets/v1beta3/crypto/us/latest/trades?symbols=" + alpaca_symbol,
+                headers=headers, timeout=5)
             d = resp.json()
             trades = d.get("trades", {})
             if alpaca_symbol in trades:
                 return float(trades[alpaca_symbol]["p"])
-        else:
-            resp = requests.get(data_url + "/v2/stocks/" + alpaca_symbol + "/trades/latest",
-                                headers=headers, timeout=5)
+        except Exception:
+            pass
+        # Try latest bars (1-min) as second option
+        try:
+            resp = requests.get(
+                "https://data.alpaca.markets/v1beta3/crypto/us/bars?symbols=" + alpaca_symbol + "&timeframe=1Min&limit=1",
+                headers=headers, timeout=5)
             d = resp.json()
-            trade = d.get("trade", {})
-            if "p" in trade:
-                return float(trade["p"])
-    except Exception:
-        pass
-    # Fallback: yfinance
+            bars = d.get("bars", {})
+            if alpaca_symbol in bars and len(bars[alpaca_symbol]) > 0:
+                return float(bars[alpaca_symbol][-1]["c"])
+        except Exception:
+            pass
+
+    if key and not is_crypto:
+        # Stocks: latest trade
+        try:
+            resp = requests.get(
+                "https://data.alpaca.markets/v2/stocks/" + symbol + "/trades/latest",
+                headers=headers, timeout=5)
+            d = resp.json()
+            if "trade" in d and "p" in d["trade"]:
+                return float(d["trade"]["p"])
+        except Exception:
+            pass
+
+    # Final fallback: yfinance 1-min bar
     try:
-        df = yf.download(symbol, period="1d", interval="1m", progress=False)
+        import time as _time
+        df = yf.download(symbol, period="1d", interval="1m", progress=False,
+                         prepost=True)
         if len(df) > 0:
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-            return float(df['Close'].iloc[-1])
+            return float(df["Close"].iloc[-1])
     except Exception:
         pass
     return None
