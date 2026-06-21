@@ -192,6 +192,20 @@ def process_trade_signal(data):
     discord_post(target_channel, embed=embed)
     discord_post(config.DISCORD_WEBHOOK_TRADE_ALERTS, embed=embed)
 
+def fmt_vol(v):
+    if v >= 1_000_000:
+        return str(round(v / 1_000_000, 2)) + "M"
+    elif v >= 1_000:
+        return str(round(v / 1_000)) + "K"
+    return str(round(v))
+
+def vol_spike_text(volume, vol_avg):
+    threshold = vol_avg * 1.5
+    passed = volume > threshold
+    pct = round((volume / threshold) * 100) if threshold > 0 else 0
+    flag = "✅ YES" if passed else "❌ NO"
+    return flag + "  (" + fmt_vol(volume) + " vs " + fmt_vol(threshold) + " needed — " + str(pct) + "% of threshold)"
+
 async def send_embed(ctx, title, color, fields, footer="Momentum Confluence Scalper"):
     embed = discord.Embed(title=title, color=color, timestamp=datetime.datetime.utcnow())
     for name, value, inline in fields:
@@ -240,14 +254,14 @@ async def cmd_check(ctx):
         ("EMA9 > EMA21", yn(ema_bull), True),
         ("Price > VWAP", yn(above_vwap), True),
         ("RSI 45-65", yn(rsi_bull) + " (" + str(round(d['rsi'], 1)) + ")", True),
-        ("Volume Spike", yn(vol_ok), True),
+        ("Volume Spike", vol_spike_text(d['volume'], d['vol_avg']), False),
         ("Above OR High", yn(or_bull), True),
         ("HTF Bullish", yn(d['htf_bull']), True),
         ("🔴 SHORT Score", str(short_score) + "/6 passing", False),
         ("EMA9 < EMA21", yn(ema_bear), True),
         ("Price < VWAP", yn(below_vwap), True),
         ("RSI 35-55", yn(rsi_bear) + " (" + str(round(d['rsi'], 1)) + ")", True),
-        ("Volume Spike", yn(vol_ok), True),
+        ("Volume Spike", vol_spike_text(d['volume'], d['vol_avg']), False),
         ("Below OR Low", yn(or_bear), True),
         ("HTF Bearish", yn(d['htf_bear']), True),
         ("📍 Candle Used", str(d['candle_time'])[:16] + " (last closed bar)", False),
@@ -278,13 +292,13 @@ async def cmd_btccheck(ctx):
         ("EMA9 > EMA21", yn(ema_bull), True),
         ("Price > VWAP", yn(above_vwap), True),
         ("RSI 45-65", yn(rsi_bull) + " (" + str(round(d['rsi'], 1)) + ")", True),
-        ("Volume Spike", yn(vol_ok), True),
+        ("Volume Spike", vol_spike_text(d['volume'], d['vol_avg']), False),
         ("HTF Bullish", yn(d['htf_bull']), True),
         ("🔴 SHORT Score", str(short_score) + "/5 passing", False),
         ("EMA9 < EMA21", yn(ema_bear), True),
         ("Price < VWAP", yn(below_vwap), True),
         ("RSI 35-55", yn(rsi_bear) + " (" + str(round(d['rsi'], 1)) + ")", True),
-        ("Volume Spike", yn(vol_ok), True),
+        ("Volume Spike", vol_spike_text(d['volume'], d['vol_avg']), False),
         ("HTF Bearish", yn(d['htf_bear']), True),
         ("📍 Candle Used", str(d['candle_time'])[:16] + " (last closed bar)", False),
         ("⚡ Trigger", "Need ALL 5 to fire a sandbox signal", False)
