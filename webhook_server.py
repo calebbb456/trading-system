@@ -537,7 +537,7 @@ async def cmd_buy(ctx):
     stop_loss = round(price - atr * 1.5, 2)
     take_profit = round(price + atr * 3.0, 2)
     # Place real Alpaca paper order
-    order_id, err = place_alpaca_order(symbol, "buy", 1, stop_loss, take_profit)
+    order_id, err = place_alpaca_order(symbol, "buy", 100, stop_loss, take_profit)
     if err:
         await send_embed(ctx, "❌ Alpaca Order Failed", 0xe74c3c, [("Error", err, False)])
         return
@@ -601,7 +601,7 @@ async def cmd_sell(ctx):
         return
     stop_loss = round(price + atr * 1.5, 2)
     take_profit = round(price - atr * 3.0, 2)
-    order_id, err = place_alpaca_order(symbol, "sell", 1, stop_loss, take_profit)
+    order_id, err = place_alpaca_order(symbol, "sell", 100, stop_loss, take_profit)
     if err:
         await send_embed(ctx, "❌ Alpaca Order Failed", 0xe74c3c, [("Error", err, False)])
         return
